@@ -501,4 +501,5 @@ fabric.properties
 logs/*
 logs_archive/*
 env/*
+db/*
 
