@@ -52,13 +52,9 @@ class capture:
                 continue
         self.l.log_info('ticker json cleared')
 
-    def get_unsold(self):
-        ls_unsold = []
-        statement = "select distinct pair from trade where action = 'BUY' and related = -1"
-        results = self.m.execute_sql(statement, False)
-        for result in results:
-            ls_unsold.append(result[0])
-        return ls_unsold
+    def get_unsold_pairs(self, ls_unsold):
+        df = self.markets_df.loc[self.markets_df['target_currency_short_name'].isin(ls_unsold)]
+        return df['pair'].tolist()
 
     async def run(self, ls_pairs, ls_unsold):
         tasks = []
@@ -97,7 +93,7 @@ class capture:
         loop = asyncio.get_event_loop()
         try:
 
-            self.clear_tmp()
+            #self.clear_tmp()
 
             df = self.call.get_ticker()
 
@@ -125,15 +121,21 @@ class capture:
 
             ls_pairs = df['pair_name'].tolist()
 
-            ls_unsold = self.get_unsold()
+            ls_unsold = self.call.get_unsold()
 
-            ls_pairs.extend(ls_unsold)
+            for base_curr in self.m.env.get_value('BASE_CURR_LIST').split(','):
+                if base_curr in ls_unsold:
+                    ls_unsold.remove(base_curr)
+
+            ls_unsold_pairs = self.get_unsold_pairs(ls_unsold)
+
+            ls_pairs.extend(ls_unsold_pairs)
 
             ls_pairs = set(ls_pairs)
 
             self.l.log_info(len(ls_pairs))
 
-            future = asyncio.ensure_future(self.run(ls_pairs, ls_unsold))
+            future = asyncio.ensure_future(self.run(ls_pairs, ls_unsold_pairs))
             loop.run_until_complete(future)
 
             # self.slack.post_message("eligible pairs successfully captured")
@@ -171,6 +173,6 @@ class _tikcer():
         if (sub_df['MACD'].mean() < 0) and (sub_df['MACD_Signal'].mean() < 0) and macd_slope:
             add_ticker = True
         if add_ticker:
+            #df.to_csv(os.path.realpath('.') + "/ticker/" + pair + ".csv")
             df = df.iloc[[len(df) - 2]]
             self.m.store_ticker(pair, df)
-            #df.to_csv(os.path.realpath('.') + "/ticker/" + pair + ".csv")
