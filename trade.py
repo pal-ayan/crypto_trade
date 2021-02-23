@@ -1,6 +1,8 @@
 import concurrent.futures
 from datetime import datetime, timezone
 
+from master import master
+
 
 def rsi_constantly_below_bottom_threshold_since_bought(df, current_index, last_buy_idx):
     if last_buy_idx is None:
@@ -20,18 +22,37 @@ class trade:
     def __init__(self, m):
         self.l = m.l
         self.m = m
-        self.markets_df = m.markets_df
+        self.markets_df = m.t_markets_df
         self.call = m.call
         self.slack = m.slack
         self.dict_ticker_df = m.dict_ticker_df
 
-    def do(self):
+    def get_already_bought(self):
+        ret_dict = {}
+        statement = "select pair, sum(total_price), ifnull(max(unixtime), 0) from trade where action = 'BUY' and related = -1 group by pair"
+        results = self.m.execute_sql(statement)
+        for result in results:
+            pair = result[0]
+            total_price = float(result[1])
+            last_bought = int(result[2])
+            ret_dict[pair] = [total_price, last_bought]
+        return ret_dict
 
+    def do(self):
+        bought_dict = self.get_already_bought()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             for key in self.dict_ticker_df:
                 p = _perform(self.m, self.l, self.call, self.markets_df)
-                futures.append(executor.submit(p.analyse, key, self.dict_ticker_df[key]))
+                is_bought = False
+                total_price = 0.0
+                last_bought = 0
+                if key in bought_dict:
+                    is_bought = True
+                    val = bought_dict[key]
+                    total_price = val[0]
+                    last_bought = val[1]
+                futures.append(executor.submit(p.analyse, key, self.dict_ticker_df[key], is_bought, total_price, last_bought))
             for future in concurrent.futures.as_completed(futures):
                 self.l.log_info(future.result())
 
@@ -70,12 +91,15 @@ class _perform:
         df = self.markets_df.loc[self.markets_df['pair'] == pair]
         return df['coindcx_name'].values[0]
 
-    def buy(self, pair, currency, timestamp, status, action, buy_amount, str_time, is_bought):
+    def buy(self, pair, currency, timestamp, status, action, buy_amount, str_time, is_bought, total_buy_price):
         self.m.acquire_lock()
         try:
             available_bal, total_bal = self.get_balance(currency)
             ret = False
             if is_bought:
+                if ((total_buy_price / total_bal) * 100) > 10:
+                    self.l.log_info(pair + ' overbought ' + str_time)
+                    ret = True
                 if buy_amount >= available_bal / 2:
                     ret = True
             else:
@@ -84,7 +108,7 @@ class _perform:
             if ret:
                 self.l.log_info(pair + ' insufficient balance ' + str_time)
                 return
-           
+
             price = self.call.get_current_price(self.get_coindcx_name(pair))
             units = buy_amount / float(price)
             remaining_bal = available_bal - float(buy_amount)
@@ -119,7 +143,36 @@ class _perform:
         self.m.acquire_lock()
         try:
             price = self.call.get_current_price(self.get_coindcx_name(pair))
-            total_buy_price, total_sell_price, total_units, profit_percent = self.calculate_profit(price, pair)
+            min_profit_price = 0.99 * float(price)
+            statement = "select id, (select count(id) from trade where pair = %(pair)s and action = 'BUY' and related = -1) as total " \
+                        "from trade where cast(price as real) < %(min_profit_price)s and pair = %(pair)s  and action = 'BUY' and related = -1" \
+                        % {"pair": "'" + pair + "'", "min_profit_price": min_profit_price}
+
+            results = self.m.execute_sql(statement)
+            ls_ids_to_sell = []
+
+            if len(results) == 0:
+                # this is a scenario where the current sell trigger price is definitley lower than all buy price
+                # hence a definitel loss scenario
+                # if the position is open for less than 7 days -> HOLD
+                statement = "SELECT ifnull(round(julianday('now') - julianday(min(timestamp))) >= 7, 0) from trade where pair = %(pair)s and action = 'BUY' and related = -1" \
+                            % {"pair": "'" + pair + "'"}
+                results = self.m.execute_sql(statement)
+                for result in results:
+                    if int(result[0]) == 1:
+                        self.l.log_info(pair + ' position has been open for MORE than 7 days')
+                    else:
+                        self.l.log_info(pair + ' position has been open for LESS than 7 days')
+                        return
+
+            for result in results:
+                if int(result[1]) == len(results):
+                    self.l.log_info(pair + ' all open positions need to be closed')
+                    break
+                else:
+                    ls_ids_to_sell.append(str(result[0]))
+
+            total_buy_price, total_sell_price, total_units, profit_percent = self.calculate_profit(price, pair, ls_ids_to_sell)
 
             available_bal, total_bal = self.get_balance(currency)
             remaining_bal = available_bal + float(total_sell_price)
@@ -149,11 +202,20 @@ class _perform:
             statement = "update balances set balance = %(remaining_bal)s where currency = %(currency)s" % substitution_dict
             self.m.execute_sql(statement, True)
 
-            substitution_dict = {
-                "pair": "'" + pair + "'"
-            }
-            statement = "update trade set related = (select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1)" \
-                        " where id in (select id from trade where pair = %(pair)s and action = 'BUY' and related = -1)" % substitution_dict
+            if len(ls_ids_to_sell) > 0:
+                substitution_dict = {
+                    "pair": "'" + pair + "'",
+                    "id_csv": ','.join(ls_ids_to_sell)
+                }
+                statement = "update trade set related = (select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1)" \
+                            " where id in (%(id_csv)s)" % substitution_dict
+            else:
+                substitution_dict = {
+                    "pair": "'" + pair + "'"
+                }
+                statement = "update trade set related = (select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1)" \
+                            " where id in (select id from trade where pair = %(pair)s and action = 'BUY' and related = -1)" % substitution_dict
+
             self.m.execute_sql(statement, True)
             self.l.log_info(pair + ' sold at ' + str_time)
         except:
@@ -161,11 +223,16 @@ class _perform:
         finally:
             self.m.release_lock()
 
-    def calculate_profit(self, sold_at, pair):
+    def calculate_profit(self, sold_at, pair, ls_ids_to_sell):
         total_buy_price = 0
         total_units = 0
 
-        statement = "select total_price, units from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
+        if len(ls_ids_to_sell) > 0:
+            id_csv = ','.join(ls_ids_to_sell)
+            statement = "select total_price, units from trade where id in (%(id_csv)s)" % {"id_csv": id_csv}
+        else:
+            statement = "select total_price, units from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
+
         results = self.m.execute_sql(statement)
 
         for result in results:
@@ -174,21 +241,10 @@ class _perform:
         total_sell_price = total_units * float(sold_at)
         return total_buy_price, total_sell_price, total_units, ((total_sell_price - total_buy_price) / total_buy_price) * 100
 
-    def is_already_bought(self, pair):
-        count = 0
-        last_bought = 0
-        statement = "select count(*), ifnull(max(unixtime), 0) from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
-        results = self.m.execute_sql(statement)
-        for result in results:
-            count = int(result[0])
-            last_bought = int(result[1])
-        return count > 0, last_bought
-
-    def analyse(self, pair, df):
+    def analyse(self, pair, df, is_bought, total_buy_price=0.0, last_bought=0):
         try:
             min_buy_amount = self.m.dict_min_notional[pair]
-            bought, last_bought = self.is_already_bought(pair)
-            self.l.log_info(pair + ' already bought -> ' + str(bought))
+            self.l.log_info(pair + ' already bought -> ' + str(is_bought))
             last_row = df
             for idx in last_row.index:
                 rsi_below_bottom_threshold = (last_row['RSI'][idx] < 30) or (((abs(30 - last_row['RSI'][idx]) / 30) * 100) < 5)
@@ -201,10 +257,10 @@ class _perform:
                         self.l.log_info(pair + ' has been bought in the last 15 mins')
                         continue
 
-                    self.buy(pair, pair.split("_")[1], last_row['time'][idx], "DONE", "BUY", min_buy_amount, str_time, bought)
+                    self.buy(pair, pair.split("_")[1], last_row['time'][idx], "DONE", "BUY", min_buy_amount, str_time, is_bought, total_buy_price)
                     continue
 
-                if bought:
+                if is_bought:
                     rsi_above_top_threshold = (last_row['RSI'][idx] > 70) and ((((last_row['RSI'][idx] - 70) / 70) * 100) > 5)
                     s_rsi_above_top_threshold = (last_row['K'][idx] > 80) and (((last_row['K'][idx] - 80) / 80) * 100) > 5
                     macd_green_above_red = last_row['MACD'][idx] > last_row['MACD_Signal'][idx] and abs(((last_row['MACD_Signal'][idx] - last_row['MACD'][idx]) / last_row['MACD'][idx]) * 100) > 5
@@ -216,3 +272,12 @@ class _perform:
 
         except:
             self.l.log_exception('Error Occurred ' + pair)
+
+
+if __name__ == "__main__":
+    m = master(None)
+    m.init_markets_df()
+    t = trade(m)
+    t.do()
+    p = _perform(m, m.l, m.call, m.markets_df)
+    print(p.call.get_current_price(p.get_coindcx_name("B-XRP_ETH")))

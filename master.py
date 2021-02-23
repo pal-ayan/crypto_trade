@@ -7,11 +7,37 @@ from threading import RLock
 from time import sleep
 
 import pandas as pd
+from pandas import json_normalize
 
 import coindcx_api_caller as cdx
+import json
 from env.load_env import load_env
 from log import log
 from slack_util import slack_util
+import numpy as np
+import sys
+
+
+def computeRSI(data, time_window):
+    diff = data.diff(1).dropna()
+    up_chg = 0 * diff
+    down_chg = 0 * diff
+    up_chg[diff > 0] = diff[diff > 0]
+    down_chg[diff < 0] = diff[diff < 0]
+    up_chg_avg = up_chg.ewm(com=time_window - 1, min_periods=time_window).mean()
+    down_chg_avg = down_chg.ewm(com=time_window - 1, min_periods=time_window).mean()
+    rs = abs(up_chg_avg / down_chg_avg)
+    rsi = 100 - 100 / (1 + rs)
+    return rsi
+
+
+def stochastic(data, k_window, d_window, window):
+    min_val = data.rolling(window=window, center=False).min()
+    max_val = data.rolling(window=window, center=False).max()
+    stoch = ((data - min_val) / (max_val - min_val)) * 100
+    K = stoch.rolling(window=k_window, center=False).mean()
+    D = K.rolling(window=d_window, center=False).mean()
+    return K, D
 
 
 def get_dataframe_info(df):
@@ -45,6 +71,27 @@ def get_start_of_day_ms():
     return dt[:dt.index('.')]
 
 
+def create_eligible_pairs_list(pair, json_str):
+    add_ticker = False
+    my_json = json_str.decode('utf-8').replace("'", '"')
+    data = json.loads(my_json)
+    df = json_normalize(data)
+    df = df.sort_index(ascending=False)
+    df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+    df['MACD'] = df['MACD'].multiply(1000000)
+    sub_df = df.tail(25).head(24)
+    macd_arr = sub_df['MACD'].tolist()
+    gradient = np.gradient(macd_arr)
+    mean_gradient = np.mean(gradient)
+    standard_deviation = np.std(macd_arr)
+    macd_mean = sub_df['MACD'].mean()
+    if (macd_mean < 0) and (mean_gradient > 0) and (abs(macd_mean) < abs(standard_deviation)):
+        add_ticker = True
+    if add_ticker:
+        with open('eligible_pair.txt', 'a') as the_file:
+            the_file.write(pair + '\n')
+
+
 class master:
 
     def __init__(self, l):
@@ -58,6 +105,7 @@ class master:
 
         self._created_threads = []
         self.markets_df = None
+        self.t_markets_df = None
         self.dict_ticker_df = {}
         self.dict_min_notional = {}
         self.l.log_info('MASTER INIT COMPLETE')
@@ -101,9 +149,11 @@ class master:
 
         if current_date == last_access_date:
             self.markets_df = pd.read_json(umd_path)
+            self.t_markets_df = pd.read_json(md_path)
             return self.markets_df
         else:
             df = self.call.get_active_market_details()
+            complete_df = df.copy()
             self.run_thread("store_market_details", store_json, [df, md_path])
 
         base_currency_list = self.env.get_value('BASE_CURR_LIST').split(',')
@@ -112,15 +162,8 @@ class master:
             base_currency_short_name = df['base_currency_short_name'][idx]
             if base_currency_short_name not in base_currency_list:
                 df.drop(idx, inplace=True)
-            else:
-                drop = False
-                min_notional = float(df['min_notional'][idx])
-                step = df['step'][idx]
-                if step / min_notional > 100:
-                    drop = True
-                if drop:
-                    df.drop(idx, inplace=True, errors="ignore")
         self.markets_df = df
+        self.t_markets_df = complete_df
         self.run_thread("store_usable_market_details", store_json, [df, umd_path])
         return df
 

@@ -1,0 +1,1 @@
+pwsh D:\repository\crypto_trade_test\backup_db_from_remote.ps1

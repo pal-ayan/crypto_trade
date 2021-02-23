@@ -1,0 +1,2 @@
+$fileName = get-date -Format "MM-dd-yyyy-HH-mm-ss"
+scp -i "C:\Users\Ayan Pal\.ssh\digital_ocean_rsa" ayan@139.59.67.112:/home/ayan/crypto_trade_test/db/buy_sell_test.db D:\sqlite\crypto_trade_test\db_backup\$fileName.db

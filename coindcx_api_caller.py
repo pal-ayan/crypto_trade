@@ -227,9 +227,3 @@ class call_api():
         data = response.json()
         df = json_normalize(data)
         pass
-
-    def get_unsold(self):
-        df = self.get_user_balances()
-        index_names = df[(df['balance'] <= 0.0)].index
-        df.drop(index_names, inplace=True)
-        return df['currency'].tolist()
