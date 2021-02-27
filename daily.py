@@ -29,7 +29,7 @@ def update_ledger(m):
     daily_change_dict = {}
     weekly_change_dict = {}
     monthly_change_dict = {}
-    available_dict, total_dict = m.get_balance()
+    total_dict = m.get_balance()
     current_day = master.get_date_as_ms_string()
     prev_day = master.get_date_as_ms_string(1)
     prev_week = master.get_date_as_ms_string(7)
@@ -77,8 +77,36 @@ def update_ledger(m):
         m.execute_sql(statement, True)
 
 
+def update_trade_history(m):
+    df = m.call.get_trade_history()
+    statement = '''
+        INSERT OR REPLACE INTO trade_history (trade_id, order_id, side, fee_amount, e_code, quantity, price, symbol, timestamp)
+        select ?, ?, ?, ?, ?, ?, ?, ?, ?
+        where not EXISTS (select * from trade_history where order_id = ?);
+    '''
+    args = []
+    for idx in df.index:
+        this_df = df.loc[idx].to_frame()
+        d = this_df.to_dict(orient='split')['data']
+        ls = []
+        for elm in d:
+            for e in elm:
+                ls.append(str(e))
+        order_id = df['order_id'][idx]
+        ls.append(order_id)
+        args.append(tuple(ls))
+    m.execute_sql_many(statement, args)
+
+
 if __name__ == "__main__":
     m = m(None)
+    slack = m.slack
+    l = m.l
     str_time = datetime.now().strftime("%Y%m%d")
-    make_tarfile()
-    update_ledger(m)
+    try:
+        make_tarfile()
+        update_ledger(m)
+        update_trade_history(m)
+    except:
+        l.log_exception("error occured with daily tasks")
+        slack.post_message("error occured with daily tasks")

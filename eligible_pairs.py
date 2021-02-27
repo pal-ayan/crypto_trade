@@ -5,10 +5,8 @@ import os
 
 import numpy as np
 from aiohttp import ClientSession
-from pandas import json_normalize
-import master
 
-import json
+import master
 
 '''
     runs once every hour, at the beginning
@@ -120,5 +118,5 @@ class capture:
 
 
         except:
-            # self.slack.post_message("error occurred in generating eligible pairs")
+            self.slack.post_message("error occurred in generating eligible pairs")
             self.l.log_exception("Error Occurred")

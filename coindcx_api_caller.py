@@ -11,9 +11,10 @@ import master
 
 
 class call_api():
-    def __init__(self, log, env):
+    def __init__(self, log, env, m):
         self._log = log
         self.env = env
+        self.m = m
 
         self.secret_bytes = bytes(self.env.get_value("COINDCX_SECRET"), encoding='utf-8')
 
@@ -28,6 +29,7 @@ class call_api():
         self._cancel_order = "https://api.coindcx.com/exchange/v1/orders/cancel"
         self._order_status = "https://api.coindcx.com/exchange/v1/orders/status"
         self._multiple_order_status = "https://api.coindcx.com/exchange/v1/orders/status_multiple"
+        self._trade_history = "https://api.coindcx.com/exchange/v1/orders/trade_history"
         self._url_separator = "&"
 
     def _call(self, url, body=None):
@@ -92,6 +94,28 @@ class call_api():
 
         return df
 
+    def get_user_balance(self, currency):
+        available_bal = 0.0
+        locked_balance = 0.0
+        df = self.get_user_balances()
+        curr_df = df[df['currency'] == currency]
+        for idx in curr_df.index:
+            available_bal = curr_df['balance'][idx]
+            locked_balance = curr_df['locked_balance'][idx]
+        return available_bal, locked_balance
+
+    def get_unsold(self):
+        bal_df = self.get_user_balances()
+
+        base_currency_list = self.env.get_value('BASE_CURR_LIST').split(',')
+
+        for idx in bal_df.index:
+            base_currency_short_name = bal_df['currency'][idx]
+            if base_currency_short_name in base_currency_list:
+                bal_df.drop(idx, inplace=True)
+
+        return bal_df, bal_df['currency'].tolist()
+
     def get_active_orders(self):
         start_time = datetime.now()
         self._log.log_info("get_active_orders method execution started")
@@ -112,8 +136,8 @@ class call_api():
         self._log.log_info('get_ticker completion took -> %s' % time_diff)
         return json_normalize(data)
 
-    def get_current_price(self, market):
-        df = self.get_ticker()
+    def get_current_price(self, market, df=None):
+        df = self.get_ticker() if df is None else df
         df = df.loc[df['market'] == market]
         return df['last_price'].values[0]
 
@@ -204,7 +228,7 @@ class call_api():
         response = self._call(self._cancel_order, body)
         data = response.json()
         df = json_normalize(data)
-        pass
+        return df
 
     def get_order_status(self, id):
         time_stamp = int(round(time.time() * 1000))
@@ -215,15 +239,27 @@ class call_api():
         response = self._call(self._order_status, body)
         data = response.json()
         df = json_normalize(data)
-        pass
+        return df
 
     def get_multiple_order_status(self, ls_ids):
         time_stamp = int(round(time.time() * 1000))
+        ids = str(ls_ids).replace("'", '"')
         body = {
-            "id": ls_ids,  # Enter your Order ID here.
+            "id": ids,  # Enter your Order ID here.
             "timestamp": time_stamp
         }
         response = self._call(self._multiple_order_status, body)
         data = response.json()
         df = json_normalize(data)
-        pass
+        return df
+
+    def get_trade_history(self):
+        time_stamp = int(round(time.time() * 1000))
+        body = {
+            "limit": 1000,
+            "timestamp": time_stamp
+        }
+        response = self._call(self._trade_history, body)
+        data = response.json()
+        df = json_normalize(data)
+        return df

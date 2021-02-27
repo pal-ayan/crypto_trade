@@ -6,16 +6,15 @@ from datetime import date, datetime, timedelta
 from threading import RLock
 from time import sleep
 
+import numpy as np
 import pandas as pd
+from env.load_env import load_env
 from pandas import json_normalize
 
 import coindcx_api_caller as cdx
 import json
-from env.load_env import load_env
 from log import log
 from slack_util import slack_util
-import numpy as np
-import sys
 
 
 def computeRSI(data, time_window):
@@ -101,13 +100,14 @@ class master:
 
         self.slack = slack_util(self.l, self.env)
 
-        self.call = cdx.call_api(self.l, self.env)
+        self.call = cdx.call_api(self.l, self.env, self)
 
         self._created_threads = []
         self.markets_df = None
         self.t_markets_df = None
         self.dict_ticker_df = {}
         self.dict_min_notional = {}
+        self.dict_step = {}
         self.l.log_info('MASTER INIT COMPLETE')
 
     def acquire_lock(self):
@@ -167,7 +167,7 @@ class master:
         self.run_thread("store_usable_market_details", store_json, [df, umd_path])
         return df
 
-    def execute_sql(self, statement, commit=False, db=os.path.realpath('.') + '/db/buy_sell_test.db'):
+    def execute_sql(self, statement, commit=False, db=os.path.realpath('.') + '/db/trade.db'):
         ls_results = []
         retry_count = 0
         self.acquire_lock()
@@ -195,32 +195,61 @@ class master:
         self.release_lock()
         return ls_results
 
+    def execute_sql_many(self, statement, args, db=os.path.realpath('.') + '/db/trade.db'):
+        self.acquire_lock()
+        conn = sql.connect(db, isolation_level='EXCLUSIVE')
+        cur = conn.cursor()
+        try:
+            self.l.log_debug(statement)
+            for arg in args:
+                self.l.log_debug(arg)
+            cur.executemany(statement, args)
+        except sql.OperationalError:
+            raise Exception('maximum retry reached for statement -> ' + statement)
+        cur.close()
+        self.l.log_debug('committing')
+        conn.commit()
+        conn.close()
+        self.release_lock()
+
     def store_ticker(self, pair, df):
         self.dict_ticker_df[pair] = df
 
     def get_balance(self):
-        ret_available = {}
         ret_total = {}
+
+        base_currency_list = self.env.get_value('BASE_CURR_LIST').split(',')
+
+        for curr in base_currency_list:
+            ret_total[curr] = 0.0
+
         statement = '''
-            select combo.c as currency, sum(combo.b) as available_bal, sum(combo.tb) as total_bal 
-            from (select currency as c, balance as b, 0 as tb from balances
-                  union
-                  select total_bal.c as c, 0 as b, sum(total_bal.b) as tb from (select t.currency as c, sum(t.total_price) as b
-                    FROM
-                    trade t
-                    where 
-                    t.action = 'BUY'
-                    and t.related = -1
-                    group by t.currency
-                    UNION
-                    select currency as c, balance as b from balances) as total_bal
-                    group by total_bal.c) 
-            as combo
-            group by combo.c
+            select t.base_currency as c, sum(t.final_price) as b
+            FROM
+            orders t
+            where 
+            t.side = 'buy'
+            and t.related = -1
+            and status = 'filled'
+            group by t.base_currency
         '''
         results = self.execute_sql(statement.strip())
         for result in results:
-            ret_total[result[0]] = float(result[2])
-            ret_available[result[0]] = float(result[1])
+            curr = result[0]
+            if curr not in base_currency_list:
+                continue
+            val = ret_total[curr] if curr in ret_total else 0.0
+            ret_total[curr] = val + float(result[1])
 
-        return ret_available, ret_total
+        df = self.call.get_user_balances()
+
+        for key in ret_total:
+            sub_df = df[df['currency'] == key]
+            bal = 0.0
+            locked_bal = 0.0
+            val = ret_total[key]
+            for idx in sub_df.index:
+                bal = sub_df['balance'][idx]
+                locked_bal = sub_df['locked_balance'][idx]
+            ret_total[key] = val + bal + locked_bal
+        return ret_total
